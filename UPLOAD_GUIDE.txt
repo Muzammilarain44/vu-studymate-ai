@@ -1,0 +1,6 @@
+VU StudyMate MERN Phase 1 backend
+
+ZIP contains 3 files: server/package.json, server/.env.example, server/src/index.js.
+Extract ZIP first. GitHub mobile Upload file may flatten paths. If that happens, use GitHub Create new file and specify each full path exactly.
+Only upload to MERN-upgrade branch, not main.
+Do not upload real .env secrets.
