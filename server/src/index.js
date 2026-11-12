@@ -8,7 +8,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 
-const { MONGODB_URI, JWT_SECRET, CLIENT_ORIGIN = 'http://localhost:5173' } = process.env;
+const { MONGODB_URI, JWT_SECRET, CLIENT_ORIGIN = 'http://localhost:5173', GEMINI_API_KEY = '' } = process.env;
 if (!MONGODB_URI || !JWT_SECRET || JWT_SECRET.length < 32) {
   console.error('Configure MONGODB_URI and JWT_SECRET (32+ characters) in server/.env');
   process.exit(1);
@@ -37,6 +37,13 @@ const packSchema = new mongoose.Schema({
   mode: { type: String, enum: ['demo', 'ai'], default: 'demo' }
 }, { timestamps: true });
 const StudyPack = mongoose.model('StudyPack', packSchema);
+const aiUsageSchema = new mongoose.Schema({
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  date: { type: String, required: true },
+  count: { type: Number, required: true, default: 0 }
+}, { timestamps: true });
+aiUsageSchema.index({ user: 1, date: 1 }, { unique: true });
+const AiUsage = mongoose.model('AiUsage', aiUsageSchema);
 const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const credentials = z.object({ email: z.string().email().max(254).transform(v => v.toLowerCase()), password: z.string().min(8).max(128) });
 const signToken = user => jwt.sign({ sub: String(user._id) }, JWT_SECRET, { algorithm: 'HS256', expiresIn: '7d' });
@@ -92,6 +99,65 @@ app.delete('/api/study-packs/:id', requireAuth, asyncRoute(async (req, res) => {
   const deleted = await StudyPack.findOneAndDelete({ _id: req.params.id, user: req.userId });
   if (!deleted) return res.status(404).json({ error: 'Not found' });
   res.status(204).end();
+}));
+const generateInput = z.object({
+  source: z.string().trim().min(100).max(15000),
+  course: z.string().trim().min(1).max(25)
+});
+app.post('/api/generate', requireAuth, rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: 'draft-7', legacyHeaders: false }), asyncRoute(async (req, res) => {
+  if (!GEMINI_API_KEY) return res.status(503).json({ error: 'AI is not configured yet' });
+  const parsed = generateInput.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Lecture text must be 100–15,000 characters and course under 25 characters' });
+  const { source, course } = parsed.data;
+  // Atomic per-user daily quota: 3 generations per day (same pilot limit as before).
+  const today = new Date().toISOString().slice(0, 10);
+  let usage = await AiUsage.findOneAndUpdate(
+    { user: req.userId, date: today, count: { $lt: 3 } },
+    { $inc: { count: 1 } },
+    { new: true }
+  );
+  if (!usage) {
+    try {
+      usage = await AiUsage.create({ user: req.userId, date: today, count: 1 });
+    } catch (e) {
+      if (e?.code === 11000) return res.status(429).json({ error: 'Daily free pilot limit reached (3 generations). Try tomorrow.' });
+      throw e;
+    }
+  }
+  const prompt = `You are an accurate study assistant for Pakistani Virtual University students. Use ONLY the lecture source below. If not in source, do not invent it. Explain concepts clearly in simple English; no claims of guaranteed exam questions. Return ONLY strict JSON with keys: title (string), summary (string, 80-180 words), takeaways (array of 3-6 strings), concepts (array of 3-6 objects {title,explanation,importance,sourceQuote}), questions (array of exactly 5 objects {question,options:[four non-duplicate options],correctIndex:0-3,explanation,sourceQuote}). Every sourceQuote must be a verbatim contiguous substring of the lecture (under 150 characters); provide concise explanations. Course: ${course}\nLECTURE:\n${source}`;
+  let result;
+  try {
+    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.25, maxOutputTokens: 3500 } })
+    });
+    if (!response.ok) {
+      const err = await response.text();
+      console.error('AI API failed', response.status, err.slice(0, 300));
+      return res.status(502).json({ error: response.status === 429 ? 'AI free-tier limit reached. Try again later.' : 'AI provider error. Please retry later.' });
+    }
+    const payload = await response.json();
+    result = JSON.parse(payload.candidates?.[0]?.content?.parts?.[0]?.text ?? 'null');
+  } catch (e) {
+    console.error('Generation error', e);
+    return res.status(502).json({ error: 'Could not generate study materials. Please retry.' });
+  }
+  if (!result || typeof result.summary !== 'string' || !Array.isArray(result.takeaways) || !Array.isArray(result.concepts) || !Array.isArray(result.questions) || result.questions.length < 1) {
+    return res.status(502).json({ error: 'Invalid AI response, please retry.' });
+  }
+  const cleanQuote = q => typeof q === 'string' && source.includes(q) ? q : 'Source quote unavailable — verify against lecture';
+  const concepts = result.concepts.slice(0, 6).map(c => ({ title: String(c.title ?? ''), explanation: String(c.explanation ?? ''), importance: String(c.importance ?? ''), sourceQuote: cleanQuote(c.sourceQuote) }));
+  const questions = result.questions.slice(0, 5).filter(q => Array.isArray(q.options) && q.options.length === 4 && Number.isInteger(q.correctIndex) && Number(q.correctIndex) >= 0 && Number(q.correctIndex) <= 3).map(q => ({ question: String(q.question ?? ''), options: q.options, correctIndex: q.correctIndex, explanation: String(q.explanation ?? ''), sourceQuote: cleanQuote(q.sourceQuote) }));
+  if (!questions.length) return res.status(502).json({ error: 'AI returned invalid quiz data' });
+  const pack = await StudyPack.create({
+    user: req.userId, course,
+    title: String(result.title ?? course + ' study notes'),
+    summary: result.summary,
+    takeaways: result.takeaways.slice(0, 6).map(String),
+    concepts, questions, mode: 'ai'
+  });
+  res.json({ ...pack.toObject(), mode: 'ai' });
 }));
 app.use((err, _req, res, _next) => {
   if (err?.code === 11000) return res.status(409).json({ error: 'Email already registered' });
