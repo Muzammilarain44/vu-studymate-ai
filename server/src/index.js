@@ -126,23 +126,34 @@ app.post('/api/generate', requireAuth, rateLimit({ windowMs: 15 * 60 * 1000, lim
     }
   }
   const prompt = `You are an accurate study assistant for Pakistani Virtual University students. Use ONLY the lecture source below. If not in source, do not invent it. Explain concepts clearly in simple English; no claims of guaranteed exam questions. Return ONLY strict JSON with keys: title (string), summary (string, 80-180 words), takeaways (array of 3-6 strings), concepts (array of 3-6 objects {title,explanation,importance,sourceQuote}), questions (array of exactly 5 objects {question,options:[four non-duplicate options],correctIndex:0-3,explanation,sourceQuote}). Every sourceQuote must be a verbatim contiguous substring of the lecture (under 150 characters); provide concise explanations. Course: ${course}\nLECTURE:\n${source}`;
-  let result;
-  try {
-    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.25, maxOutputTokens: 3500 } })
-    });
-    if (!response.ok) {
-      const err = await response.text();
-      console.error('AI API failed', response.status, err.slice(0, 300));
-      return res.status(502).json({ error: response.status === 429 ? 'AI free-tier limit reached. Try again later.' : 'AI provider error. Please retry later.' });
+  // Try free models in order: if one is overloaded or retired, fall back to the next.
+  const models = (process.env.GEMINI_MODELS || 'gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash-lite').split(',').map(s => s.trim()).filter(Boolean);
+  let result = null;
+  let rateLimited = false;
+  for (const model of models) {
+    try {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.25, maxOutputTokens: 3500 } })
+      });
+      if (!response.ok) {
+        const err = await response.text();
+        console.error('AI API failed', model, response.status, err.slice(0, 300));
+        if (response.status === 429) rateLimited = true;
+        if ([429, 404, 503].includes(response.status)) continue; // try the next model
+        return res.status(502).json({ error: 'AI provider error. Please retry later.' });
+      }
+      const payload = await response.json();
+      result = JSON.parse(payload.candidates?.[0]?.content?.parts?.[0]?.text ?? 'null');
+      break;
+    } catch (e) {
+      console.error('Generation error', model, e?.message || e);
+      continue; // try the next model
     }
-    const payload = await response.json();
-    result = JSON.parse(payload.candidates?.[0]?.content?.parts?.[0]?.text ?? 'null');
-  } catch (e) {
-    console.error('Generation error', e);
-    return res.status(502).json({ error: 'Could not generate study materials. Please retry.' });
+  }
+  if (!result) {
+    return res.status(502).json({ error: rateLimited ? 'AI free-tier limit reached. Try again later.' : 'AI provider error. Please retry later.' });
   }
   if (!result || typeof result.summary !== 'string' || !Array.isArray(result.takeaways) || !Array.isArray(result.concepts) || !Array.isArray(result.questions) || result.questions.length < 1) {
     return res.status(502).json({ error: 'Invalid AI response, please retry.' });
