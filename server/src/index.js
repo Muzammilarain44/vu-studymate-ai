@@ -15,6 +15,7 @@ if (!MONGODB_URI || !JWT_SECRET || JWT_SECRET.length < 32) {
 }
 const app = express();
 app.disable('x-powered-by');
+app.set('trust proxy', 1);
 app.use(helmet());
 app.use(cors({ origin: CLIENT_ORIGIN.split(',').map(s => s.trim()) }));
 app.use(express.json({ limit: '100kb' }));
@@ -127,7 +128,7 @@ app.post('/api/generate', requireAuth, rateLimit({ windowMs: 15 * 60 * 1000, lim
   const prompt = `You are an accurate study assistant for Pakistani Virtual University students. Use ONLY the lecture source below. If not in source, do not invent it. Explain concepts clearly in simple English; no claims of guaranteed exam questions. Return ONLY strict JSON with keys: title (string), summary (string, 80-180 words), takeaways (array of 3-6 strings), concepts (array of 3-6 objects {title,explanation,importance,sourceQuote}), questions (array of exactly 5 objects {question,options:[four non-duplicate options],correctIndex:0-3,explanation,sourceQuote}). Every sourceQuote must be a verbatim contiguous substring of the lecture (under 150 characters); provide concise explanations. Course: ${course}\nLECTURE:\n${source}`;
   let result;
   try {
-    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent', {
+    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
       body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.25, maxOutputTokens: 3500 } })
